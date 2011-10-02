@@ -5,6 +5,9 @@
   "author": "Maurice Machado <maurice@bitbending.com>",
   "homepage": "http://zappajs.org",
   "repository": {"type": "git", "url": "git://github.com/mauricemach/zappa.git"},
+  "scripts": {
+      "test": "cake test"
+  },
   "dependencies": {
     "express": "2.4.6",
     "socket.io": "0.8.4",
