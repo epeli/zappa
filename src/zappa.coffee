@@ -12,9 +12,13 @@ path = require 'path'
 uuid = require 'node-uuid'
 express = require 'express'
 socketio = require 'socket.io'
+pile = require 'pile'
+uglify = require 'uglify-js'
+
 jquery = fs.readFileSync(__dirname + '/../vendor/jquery-1.6.4.min.js').toString()
 sammy = fs.readFileSync(__dirname + '/../vendor/sammy-0.7.0.min.js').toString()
-uglify = require 'uglify-js'
+
+
 
 # Soft dependencies:
 jsdom = null
@@ -38,11 +42,11 @@ coffeescript_helpers = """
     } return -1; };
 """.replace /\n/g, ''
 
-minify = (js) ->
-  ast = uglify.parser.parse(js)
-  ast = uglify.uglify.ast_mangle(ast)
-  ast = uglify.uglify.ast_squeeze(ast)
-  uglify.uglify.gen_code(ast)
+# Asset manager
+jsAssets = pile.createJSManager()
+cssAssets = pile.createCSSManager()
+
+
 
 # Shallow copy attributes from `sources` (array of objects) to `recipient`.
 # Does NOT overwrite attributes already present in `recipient`.
@@ -54,11 +58,11 @@ copy_data_to = (recipient, sources) ->
 # Keep inline views at the module level and namespaced by app id
 # so that the monkeypatched express can look them up.
 views = {}
-  
+
 # Monkeypatch express to support lookup of inline templates. Such is life.
 express.View.prototype.__defineGetter__ 'exists', ->
   # Path given by zappa: /path/to/appid/foo.bar.
-  
+
   # Try appid/foo.bar in memory.
   p = @path.replace @root + '/', ''
   id = p.split('/')[0]
@@ -95,7 +99,7 @@ express.View.prototype.__defineGetter__ 'contents', ->
 # Takes in a function and builds express/socket.io apps based on the rules contained in it.
 zappa.app = (func) ->
   context = {id: uuid(), zappa, express}
-  
+
   context.root = path.dirname(module.parent.filename)
 
   # Storage for user-provided stuff.
@@ -103,12 +107,30 @@ zappa.app = (func) ->
   ws_handlers = {}
   helpers = {}
   postrenders = {}
-  
+
   app = context.app = express.createServer()
   io = context.io = socketio.listen(app)
 
+  app.configure ->
+    jsAssets.bind app
+    cssAssets.bind app
+
+  app.configure "development", ->
+    jsAssets.liveUpdate(cssAssets, io)
+
   # Reference to the zappa client, the value will be set later.
   client = null
+
+  # We have to change how @enable works, because these assets must be served
+  # before any @client etc. code will be added. This would need more proper
+  # rewrite.
+  buildinAssets =
+    "serve jquery": ->
+      jsAssets.addFile __dirname + '/../vendor/jquery-1.6.4.min.js'
+    "serve sammy": ->
+      jsAssets.addFile __dirname + '/../vendor/sammy-0.7.0.min.js'
+    "serve zappa": ->
+      jsAssets.addRaw ";#{coffeescript_helpers}(#{client})();"
 
   # Zappa's default settings.
   app.set 'view engine', 'coffee'
@@ -116,10 +138,13 @@ zappa.app = (func) ->
     blacklist: ['format', 'autoescape', 'locals', 'hardcode', 'cache']
 
   # Builds the applications's root scope.
-  
+
   # Sets default view dir to @root (`path.dirname(module.parent.filename)`).
   app.set 'views', path.join(context.root, '/views')
-  
+
+  # The stringified zappa client.
+  client = require('./client').build(zappa.version, coffeescript_helpers, app.settings)
+
   for verb in ['get', 'post', 'put', 'del']
     do (verb) ->
       context[verb] = ->
@@ -129,35 +154,40 @@ zappa.app = (func) ->
           for k, v of arguments[0]
             route verb: verb, path: k, handler: v
 
-  context.client = (obj) ->
-    app.enable 'serve zappa'
+  handleNamespace = (fn) -> (pileName, obj=null) ->
+    if typeof pileName is "object"
+      fn.call context, pileName
+    else
+      # Call with default global pile
+      fn.call context, _global: pileName
+
+  context.client = handleNamespace (obj) ->
+    context.enable "serve zappa"
     for k, v of obj
       js = ";zappa.run(#{v});"
-      js = minify(js) if app.settings['minify']
-      route verb: 'get', path: k, handler: js, contentType: 'js'
+      jsAssets.addRaw k, js
 
-  context.coffee = (obj) ->
+  context.coffee = handleNamespace (obj) ->
     for k, v of obj
       js = ";#{coffeescript_helpers}(#{v})();"
-      js = minify(js) if app.settings['minify']
-      route verb: 'get', path: k, handler: js, contentType: 'js'
+      jsAssets.addRaw k, js
 
-  context.js = (obj) ->
+  context.js = handleNamespace (obj) ->
     for k, v of obj
       js = String(v)
-      js = minify(js) if app.settings['minify']
-      route verb: 'get', path: k, handler: js, contentType: 'js'
+      jsAssets.addRaw k, js
 
-  context.css = (obj) ->
+  context.css = handleNamespace (obj) ->
     for k, v of obj
       css = String(v)
-      route verb: 'get', path: k, handler: css, contentType: 'css'
+      cssAssets.addRaw k, css
 
-  context.stylus = (obj) ->
-    for k, v of obj
+  context.stylus = handleNamespace (obj) ->
+    for k, v of obj then do (k, v) ->
       css = require('stylus').render v, filename: k, (err, css) ->
         throw err if err
-        route verb: 'get', path: k, handler: css, contentType: 'css'
+        cssAssets.addRaw k, css
+
 
   context.helper = (obj) ->
     for k, v of obj
@@ -183,8 +213,9 @@ zappa.app = (func) ->
   context.set = (obj) ->
     for k, v of obj
       app.set k, v
-      
-  context.enable = ->
+
+  context.enable = (value) ->
+    buildinAssets[value]?()
     app.enable i for i in arguments
 
   context.disable = ->
@@ -200,25 +231,26 @@ zappa.app = (func) ->
         app.use wrappers[name](arg)
       else if typeof express[name] is 'function'
         app.use express[name](arg)
-     
+
     for a in arguments
       switch typeof a
         when 'function' then app.use a
         when 'string' then use a
         when 'object' then use k, v for k, v of a
-    
+
   context.configure = (p) ->
     if typeof p is 'function' then app.configure p
     else app.configure k, v for k, v of p
-    
+
+
+
   context.settings = app.settings
 
   context.shared = (obj) ->
-    app.enable 'serve zappa'
+    context.enable "serve zappa"
     for k, v of obj
       js = ";zappa.run(#{v});"
-      js = minify(js) if app.settings['minify']
-      route verb: 'get', path: k, handler: js, contentType: 'js'
+      jsAssets.addRaw js
       v.apply(context, [context])
 
   context.include = (p) ->
@@ -257,11 +289,11 @@ zappa.app = (func) ->
           # express.View.exists and express.View.contents can lookup
           # this app's inline templates.
           args[0] = context.id + '/' + args[0]
-        
+
           # Make sure the second arg is an object.
           args[1] ?= {}
           args.splice 1, 0, {} if typeof args[1] is 'function'
-        
+
           if app.settings['databag']
             args[1].params = data
 
@@ -293,15 +325,15 @@ zappa.app = (func) ->
           when 'this' then result = r.handler.apply(data, [ctx])
           when 'param' then result = r.handler.apply(ctx, [data])
           else result = r.handler.apply(ctx, [ctx])
-        
+
         res.contentType(r.contentType) if r.contentType?
         if typeof result is 'string' then res.send result
         else return result
-  
+
   # Register socket.io handlers.
   io.sockets.on 'connection', (socket) ->
     c = {}
-    
+
     build_ctx = ->
       ctx =
         app: app
@@ -350,25 +382,6 @@ zappa.app = (func) ->
   # Go!
   func.apply(context, [context])
 
-  # The stringified zappa client.
-  client = require('./client').build(zappa.version, coffeescript_helpers, app.settings)
-
-  if app.settings['serve zappa']
-    app.get '/zappa/zappa.js', (req, res) ->
-      js = ";#{coffeescript_helpers}(#{client})();"
-      js = minify(js) if app.settings['minify']
-      res.contentType 'js'
-      res.send js
-
-  if app.settings['serve jquery']
-    app.get '/zappa/jquery.js', (req, res) ->
-      res.contentType 'js'
-      res.send jquery
-
-  if app.settings['serve sammy']
-    app.get '/zappa/sammy.js', (req, res) ->
-      res.contentType 'js'
-      res.send sammy
 
   if app.settings['default layout']
     context.view layout: ->
@@ -376,15 +389,7 @@ zappa.app = (func) ->
       html ->
         head ->
           title @title if @title
-          if @scripts
-            for s in @scripts
-              script src: s + '.js'
-          script(src: @script + '.js') if @script
-          if @stylesheets
-            for s in @stylesheets
-              link rel: 'stylesheet', href: s + '.css'
-          link(rel: 'stylesheet', href: @stylesheet + '.css') if @stylesheet
-          style @style if @style
+          @renderStyleTags() + @renderScriptTags()
         body @body
 
   context
@@ -425,11 +430,11 @@ zappa.run = ->
 
 # Creates a zappa view adapter for templating engine `engine`. This adapter
 # can be used with `app.register` and creates params "shortcuts".
-# 
+#
 # Zappa, by default, automatically sends all request params to templates,
 # but inside the `params` local.
 #
-# This adapter adds a "root local" for each of these params, *only* 
+# This adapter adds a "root local" for each of these params, *only*
 # if a local with the same name doesn't exist already, *and* the name is not
 # in the optional blacklist.
 #
@@ -454,3 +459,4 @@ module.exports.run = zappa.run
 module.exports.app = zappa.app
 module.exports.adapter = zappa.adapter
 module.exports.version = zappa.version
+
