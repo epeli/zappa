@@ -12,7 +12,7 @@ path = require 'path'
 uuid = require 'node-uuid'
 express = require 'express'
 socketio = require 'socket.io'
-pile = require 'pile'
+piler = require 'piler'
 uglify = require 'uglify-js'
 
 jquery = fs.readFileSync(__dirname + '/../vendor/jquery-1.6.4.min.js').toString()
@@ -43,8 +43,8 @@ coffeescript_helpers = """
 """.replace /\n/g, ''
 
 # Asset manager
-jsAssets = pile.createJSManager()
-cssAssets = pile.createCSSManager()
+jsAssets = piler.createJSManager()
+cssAssets = piler.createCSSManager()
 
 
 

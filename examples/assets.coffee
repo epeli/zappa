@@ -14,7 +14,11 @@ require('./zappa') ->
 
   @view index: ->
         div ->
-          h1 -> "Hello, node-pile in Zappa!"
+          h1 -> "Hello, Piler in Zappa!"
+          p ->
+            span -> "Checkout the log and "
+            a href: "http://epeli.github.com/piler/", -> "Piler homepage!"
+
 
   @css '''
   h1 {
